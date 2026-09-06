@@ -1,26 +1,24 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
+const cors = require('cors'); // CORS इम्पोर्ट करें
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+app.use(cors()); // CORS को सभी ओरिजिन के लिए चालू करें
 app.use(express.json());
 
-// चेक करने के लिए कि सर्वर चल रहा है या नहीं
 app.get('/', (req, res) => {
-    sendResponse = { status: 'Watcher Backend Server is running successfully!' };
-    res.json(sendResponse);
+    res.json({ status: 'Watcher Backend Server is running successfully!' });
 });
 
-// WebSocket कनेक्शन हैंडल करना (लोकेशन, स्क्रीन या कमांड के लिए)
 wss.on('connection', (ws) => {
     console.log('A new client connected.');
 
     ws.on('message', (message) => {
         console.log('Received:', message.toString());
-        // यहाँ आने वाले डेटा को ब्रॉडकास्ट या प्रोसेस किया जा सकता है
         ws.send(JSON.stringify({ status: 'Message received by server' }));
     });
 
