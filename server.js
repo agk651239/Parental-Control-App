@@ -21,11 +21,9 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// MongoDB Atlas Connection
-mongoose.connect(process.env.MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-}).then(() => {
+// MongoDB Atlas Connection (Cleaned up to avoid warnings)
+mongoose.connect(process.env.MONGO_URI)
+.then(() => {
     console.log('MongoDB Atlas Connected Successfully');
 }).catch((err) => {
     console.error('MongoDB Connection Error:', err);
