@@ -12,6 +12,7 @@ const admin = require('firebase-admin');
 const Media = require('./models/Media');
 const Device = require('./models/Device');
 const PairCode = require('./models/PairCode');
+const ActivityLog = require('./models/ActivityLog');
 
 // Middleware
 const { apiLimiter, uploadLimiter } = require('./middleware/rateLimit');
@@ -69,6 +70,23 @@ async function generateUniqueCode() {
     }
     if (exists) throw new Error('Could not generate unique code');
     return code;
+}
+
+// Device token auth middleware
+async function deviceAuth(req, res, next) {
+    try {
+        const deviceToken = req.headers['x-device-token'];
+        if (!deviceToken) return res.status(401).json({ error: 'Device token required' });
+
+        const device = await Device.findOne({ deviceToken });
+        if (!device) return res.status(401).json({ error: 'Invalid device token' });
+
+        req.device = device;
+        req.deviceId = device.deviceId;
+        next();
+    } catch (err) {
+        res.status(401).json({ error: err.message });
+    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -157,6 +175,29 @@ app.post('/api/device/pair', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+//  GET Device Status (Child polling ke liye)  ← NAYA
+// ═══════════════════════════════════════════════════════════
+app.get('/api/device/status', async (req, res) => {
+    try {
+        const { deviceId } = req.query;
+        if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+        const device = await Device.findOne({ deviceId });
+        if (!device) return res.status(404).json({ error: 'Device not found' });
+
+        res.json({
+            success: true,
+            isPaired: device.isPaired,
+            deviceToken: device.isPaired ? device.deviceToken : null,
+            deviceName: device.deviceName,
+            lastSeen: device.lastSeen
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
 //  List Paired Devices
 // ═══════════════════════════════════════════════════════════
 app.get('/api/device/list', async (req, res) => {
@@ -218,6 +259,28 @@ app.post('/api/device/fcm-token', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+//  Heartbeat (Child app sends every 60 sec)  ← NAYA
+// ═══════════════════════════════════════════════════════════
+app.post('/api/device/heartbeat', deviceAuth, async (req, res) => {
+    try {
+        const { timestamp, appVersion } = req.body;
+
+        req.device.lastSeen = new Date();
+        if (appVersion) req.device.appVersion = appVersion;
+        await req.device.save();
+
+        res.json({
+            success: true,
+            message: 'Heartbeat received',
+            serverTime: new Date().toISOString(),
+            receivedTimestamp: timestamp || Date.now()
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
 //  SEND COMMAND to Child Device (FCM)
 // ═══════════════════════════════════════════════════════════
 app.post('/api/command/send', async (req, res) => {
@@ -241,9 +304,73 @@ app.post('/api/command/send', async (req, res) => {
         };
 
         const response = await admin.messaging().send(message);
+
+        // Log activity
+        try {
+            await ActivityLog.create({
+                deviceId,
+                type: 'command_sent',
+                title: `Command sent: ${command}`,
+                description: JSON.stringify(payload || {}),
+                severity: 'info',
+                metadata: { command }
+            });
+        } catch (_) {}
+
         res.json({ success: true, message: 'Command sent', fcmResponseId: response });
     } catch (err) {
         console.error('Command send error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  Command Acknowledgment  ← NAYA
+// ═══════════════════════════════════════════════════════════
+app.post('/api/command/ack', deviceAuth, async (req, res) => {
+    try {
+        const { command, status, message, timestamp } = req.body;
+        if (!command) return res.status(400).json({ error: 'command required' });
+
+        await ActivityLog.create({
+            deviceId: req.deviceId,
+            type: 'command_executed',
+            title: `Command ${status}: ${command}`,
+            description: message || '',
+            severity: status === 'success' ? 'info' : 'warning',
+            metadata: {
+                command,
+                status,
+                clientTimestamp: timestamp
+            }
+        });
+
+        res.json({ success: true, message: 'ACK received' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  Activity Log  ← NAYA
+// ═══════════════════════════════════════════════════════════
+app.post('/api/activity/save', deviceAuth, async (req, res) => {
+    try {
+        const { type, title, description, severity, metadata, timestamp } = req.body;
+        if (!type || !title) return res.status(400).json({ error: 'type and title required' });
+
+        const log = await ActivityLog.create({
+            deviceId: req.deviceId,
+            type,
+            title,
+            description: description || '',
+            severity: severity || 'info',
+            metadata: metadata || {},
+            timestamp: timestamp ? new Date(timestamp) : new Date()
+        });
+
+        res.json({ success: true, message: 'Activity logged', id: log._id });
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -282,11 +409,33 @@ app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res) =
 // ═══════════════════════════════════════════════════════════
 wss.on('connection', (ws) => {
     console.log('WS client connected');
-    ws.on('message', (msg) => {
-        console.log('WS:', msg.toString());
-        ws.send(JSON.stringify({ status: 'received' }));
+
+    ws.on('message', async (msg) => {
+        try {
+            const data = JSON.parse(msg.toString());
+
+            if (data.type === 'ping') {
+                ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+                return;
+            }
+
+            if (data.type === 'hello') {
+                ws.send(JSON.stringify({
+                    type: 'welcome',
+                    serverTime: Date.now(),
+                    deviceId: data.deviceId
+                }));
+                return;
+            }
+
+            ws.send(JSON.stringify({ status: 'received', type: data.type }));
+        } catch (e) {
+            ws.send(JSON.stringify({ status: 'error', error: e.message }));
+        }
     });
+
     ws.on('close', () => console.log('WS client disconnected'));
+    ws.on('error', (err) => console.error('WS error:', err.message));
 });
 
 // ═══════════════════════════════════════════════════════════
