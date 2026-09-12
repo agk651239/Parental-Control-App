@@ -1,3 +1,5 @@
+const mongoose = require('mongoose');
+
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true },
   email: { type: String, required: true, unique: true, lowercase: true },
@@ -5,8 +7,7 @@ const userSchema = new mongoose.Schema({
   password: { type: String, required: true, select: false },
   role: { type: String, enum: ['parent', 'child'], default: 'parent' },
 
-  // ⚡ Subscription (UPDATED)
-  plan: { type: String, default: 'free' }, // 'free' | planId (weekly, monthly, etc)
+  plan: { type: String, default: 'free' },
   planExpiry: { type: Date, default: null },
   activePlanId: { type: String, default: null },
   razorpayPaymentId: { type: String, default: null },
@@ -16,3 +17,5 @@ const userSchema = new mongoose.Schema({
   isActive: { type: Boolean, default: true },
   lastLogin: { type: Date, default: Date.now }
 }, { timestamps: true });
+
+module.exports = mongoose.model('User', userSchema);
