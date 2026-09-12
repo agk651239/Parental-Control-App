@@ -13,14 +13,15 @@ const Media = require('./models/Media');
 const Device = require('./models/Device');
 const PairCode = require('./models/PairCode');
 
+// Middleware
+const { apiLimiter, uploadLimiter } = require('./middleware/rateLimit');
+
 // ═══════════════════════════════════════════════════════════
 //  FIREBASE ADMIN INIT
 // ═══════════════════════════════════════════════════════════
 try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     console.log('✅ Firebase Admin initialized');
 } catch (err) {
     console.error('❌ Firebase Admin init failed:', err.message);
@@ -31,7 +32,11 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Global rate limit
+app.use('/api', apiLimiter);
 
 // ═══════════════════════════════════════════════════════════
 //  CLOUDINARY CONFIG
@@ -55,30 +60,38 @@ const upload = multer({ storage: multer.memoryStorage() });
 //  HELPERS
 // ═══════════════════════════════════════════════════════════
 async function generateUniqueCode() {
-    let code;
-    let exists = true;
-    let attempts = 0;
-
+    let code, exists = true, attempts = 0;
     while (exists && attempts < 10) {
         code = Math.floor(100000 + Math.random() * 900000).toString();
         const existing = await PairCode.findOne({ code });
         if (!existing) exists = false;
         attempts++;
     }
-
     if (exists) throw new Error('Could not generate unique code');
     return code;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  ROUTE: Health Check
+//  NEW ROUTES (modular)
+// ═══════════════════════════════════════════════════════════
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/location', require('./routes/location'));
+app.use('/api/geofence', require('./routes/geofence'));
+app.use('/api/notification', require('./routes/notification'));
+app.use('/api/contact', require('./routes/contact'));
+app.use('/api/recording', require('./routes/recording'));
+app.use('/api/media', require('./routes/media'));
+app.use('/api/subscription', require('./routes/subscription'));
+
+// ═══════════════════════════════════════════════════════════
+//  Health Check
 // ═══════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
-    res.json({ status: 'Watcher Backend Server is running!' });
+    res.json({ status: 'Watcher Backend Server is running!', time: new Date().toISOString() });
 });
 
 // ═══════════════════════════════════════════════════════════
-//  ROUTE 1: Child App → Generate Pairing Code
+//  Child App → Generate Pairing Code
 // ═══════════════════════════════════════════════════════════
 app.post('/api/device/request-code', async (req, res) => {
     try {
@@ -87,45 +100,31 @@ app.post('/api/device/request-code', async (req, res) => {
 
         let device = await Device.findOne({ deviceId });
         if (!device) {
-            device = new Device({
-                deviceId,
-                deviceName: deviceName || 'Unknown Device'
-            });
+            device = new Device({ deviceId, deviceName: deviceName || 'Unknown Device' });
             await device.save();
         }
-
-        if (device.isPaired) {
-            return res.status(400).json({ error: 'Already paired', isPaired: true });
-        }
+        if (device.isPaired) return res.status(400).json({ error: 'Already paired', isPaired: true });
 
         await PairCode.deleteMany({ deviceId, isUsed: false });
         const code = await generateUniqueCode();
 
         await PairCode.create({
-            code,
-            deviceId,
-            deviceName: device.deviceName,
+            code, deviceId, deviceName: device.deviceName,
             expiresAt: new Date(Date.now() + 10 * 60 * 1000)
         });
 
-        res.json({
-            success: true,
-            code,
-            deviceId,
-            deviceName: device.deviceName,
-            expiresIn: 600
-        });
+        res.json({ success: true, code, deviceId, deviceName: device.deviceName, expiresIn: 600 });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 // ═══════════════════════════════════════════════════════════
-//  ROUTE 2: Parent App → Pair Device
+//  Parent App → Pair Device
 // ═══════════════════════════════════════════════════════════
 app.post('/api/device/pair', async (req, res) => {
     try {
-        const { code } = req.body;
+        const { code, userId } = req.body;
         if (!code) return res.status(400).json({ error: 'code required' });
 
         const pairCode = await PairCode.findOne({ code });
@@ -140,6 +139,7 @@ app.post('/api/device/pair', async (req, res) => {
         const deviceToken = crypto.randomBytes(32).toString('hex');
         device.isPaired = true;
         device.deviceToken = deviceToken;
+        if (userId) device.userId = userId;
         await device.save();
 
         pairCode.isUsed = true;
@@ -148,10 +148,7 @@ app.post('/api/device/pair', async (req, res) => {
         res.json({
             success: true,
             message: 'Device paired',
-            device: {
-                deviceId: device.deviceId,
-                deviceName: device.deviceName
-            },
+            device: { deviceId: device.deviceId, deviceName: device.deviceName },
             deviceToken
         });
     } catch (err) {
@@ -160,14 +157,13 @@ app.post('/api/device/pair', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  ROUTE 3: List Paired Devices
+//  List Paired Devices
 // ═══════════════════════════════════════════════════════════
 app.get('/api/device/list', async (req, res) => {
     try {
         const devices = await Device.find({ isPaired: true })
             .select('deviceId deviceName lastSeen isPaired createdAt')
             .sort({ createdAt: -1 });
-
         res.json({ success: true, count: devices.length, devices });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -175,7 +171,7 @@ app.get('/api/device/list', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  ROUTE 4: Refresh Pairing Code
+//  Refresh Pairing Code
 // ═══════════════════════════════════════════════════════════
 app.post('/api/device/refresh-code', async (req, res) => {
     try {
@@ -190,9 +186,7 @@ app.post('/api/device/refresh-code', async (req, res) => {
         const code = await generateUniqueCode();
 
         await PairCode.create({
-            code,
-            deviceId,
-            deviceName: device.deviceName,
+            code, deviceId, deviceName: device.deviceName,
             expiresAt: new Date(Date.now() + 10 * 60 * 1000)
         });
 
@@ -203,14 +197,12 @@ app.post('/api/device/refresh-code', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  ROUTE 5: Save FCM Token (Child App bhejega)
+//  Save FCM Token
 // ═══════════════════════════════════════════════════════════
 app.post('/api/device/fcm-token', async (req, res) => {
     try {
         const { deviceId, fcmToken } = req.body;
-        if (!deviceId || !fcmToken) {
-            return res.status(400).json({ error: 'deviceId and fcmToken required' });
-        }
+        if (!deviceId || !fcmToken) return res.status(400).json({ error: 'deviceId and fcmToken required' });
 
         const device = await Device.findOne({ deviceId });
         if (!device) return res.status(404).json({ error: 'Device not found' });
@@ -226,21 +218,16 @@ app.post('/api/device/fcm-token', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  ROUTE 6: SEND COMMAND to Child Device (FCM)
+//  SEND COMMAND to Child Device (FCM)
 // ═══════════════════════════════════════════════════════════
 app.post('/api/command/send', async (req, res) => {
     try {
         const { deviceId, command, payload } = req.body;
-
-        if (!deviceId || !command) {
-            return res.status(400).json({ error: 'deviceId and command required' });
-        }
+        if (!deviceId || !command) return res.status(400).json({ error: 'deviceId and command required' });
 
         const device = await Device.findOne({ deviceId });
         if (!device) return res.status(404).json({ error: 'Device not found' });
-        if (!device.fcmToken) {
-            return res.status(400).json({ error: 'Device has no FCM token yet' });
-        }
+        if (!device.fcmToken) return res.status(400).json({ error: 'Device has no FCM token yet' });
 
         const message = {
             token: device.fcmToken,
@@ -250,19 +237,11 @@ app.post('/api/command/send', async (req, res) => {
                     Object.entries(payload).map(([k, v]) => [k, String(v)])
                 ) : {})
             },
-            android: {
-                priority: 'high',
-                ttl: 60 * 1000
-            }
+            android: { priority: 'high', ttl: 60 * 1000 }
         };
 
         const response = await admin.messaging().send(message);
-
-        res.json({
-            success: true,
-            message: 'Command sent',
-            fcmResponseId: response
-        });
+        res.json({ success: true, message: 'Command sent', fcmResponseId: response });
     } catch (err) {
         console.error('Command send error:', err);
         res.status(500).json({ error: err.message });
@@ -270,14 +249,13 @@ app.post('/api/command/send', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  ROUTE 7: Media Upload
+//  Media Upload
 // ═══════════════════════════════════════════════════════════
-app.post('/api/upload', upload.single('file'), async (req, res) => {
+app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'No file' });
 
         const { deviceId, mediaType } = req.body;
-
         const uploadStream = cloudinary.uploader.upload_stream(
             { folder: 'parental_control_media', resource_type: 'auto' },
             async (error, result) => {
@@ -293,7 +271,6 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
                 res.json({ success: true, url: result.secure_url });
             }
         );
-
         uploadStream.end(req.file.buffer);
     } catch (err) {
         res.status(500).json({ error: err.message });
