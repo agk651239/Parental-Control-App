@@ -13,6 +13,7 @@ const Media = require('./models/Media');
 const Device = require('./models/Device');
 const PairCode = require('./models/PairCode');
 const ActivityLog = require('./models/ActivityLog');
+const User = require('./models/User');
 
 // Middleware
 const { apiLimiter, uploadLimiter } = require('./middleware/rateLimit');
@@ -90,7 +91,7 @@ async function deviceAuth(req, res, next) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  NEW ROUTES (modular)
+//  MODULAR ROUTES
 // ═══════════════════════════════════════════════════════════
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/location', require('./routes/location'));
@@ -175,7 +176,7 @@ app.post('/api/device/pair', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  GET Device Status (Child polling ke liye)  ← NAYA
+//  GET Device Status
 // ═══════════════════════════════════════════════════════════
 app.get('/api/device/status', async (req, res) => {
     try {
@@ -259,7 +260,7 @@ app.post('/api/device/fcm-token', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  Heartbeat (Child app sends every 60 sec)  ← NAYA
+//  Heartbeat
 // ═══════════════════════════════════════════════════════════
 app.post('/api/device/heartbeat', deviceAuth, async (req, res) => {
     try {
@@ -305,7 +306,6 @@ app.post('/api/command/send', async (req, res) => {
 
         const response = await admin.messaging().send(message);
 
-        // Log activity
         try {
             await ActivityLog.create({
                 deviceId,
@@ -325,7 +325,51 @@ app.post('/api/command/send', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  Command Acknowledgment  ← NAYA
+//  🆕 GRANT ALL VIA SHIZUKU (Remote)
+// ═══════════════════════════════════════════════════════════
+app.post('/api/command/grant-all', async (req, res) => {
+    try {
+        const { deviceId } = req.body;
+        if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
+
+        const device = await Device.findOne({ deviceId });
+        if (!device) return res.status(404).json({ error: 'Device not found' });
+        if (!device.fcmToken) return res.status(400).json({ error: 'Device has no FCM token' });
+
+        const message = {
+            token: device.fcmToken,
+            data: {
+                command: 'GRANT_ALL_VIA_SHIZUKU',
+                timestamp: String(Date.now())
+            },
+            android: { priority: 'high', ttl: 60 * 1000 }
+        };
+
+        const response = await admin.messaging().send(message);
+
+        try {
+            await ActivityLog.create({
+                deviceId,
+                type: 'command_sent',
+                title: 'Grant all permissions requested',
+                description: 'Via Shizuku',
+                severity: 'info'
+            });
+        } catch (_) {}
+
+        res.json({
+            success: true,
+            message: 'Grant command sent',
+            fcmResponseId: response
+        });
+    } catch (err) {
+        console.error('Grant all error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  Command Acknowledgment
 // ═══════════════════════════════════════════════════════════
 app.post('/api/command/ack', deviceAuth, async (req, res) => {
     try {
@@ -352,7 +396,7 @@ app.post('/api/command/ack', deviceAuth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  Activity Log  ← NAYA
+//  Activity Log
 // ═══════════════════════════════════════════════════════════
 app.post('/api/activity/save', deviceAuth, async (req, res) => {
     try {
@@ -403,7 +447,6 @@ app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res) =
         res.status(500).json({ error: err.message });
     }
 });
-
 // ═══════════════════════════════════════════════════════════
 //  WEBSOCKET
 // ═══════════════════════════════════════════════════════════
@@ -428,6 +471,12 @@ wss.on('connection', (ws) => {
                 return;
             }
 
+            if (data.type === 'quality_update') {
+                console.log('Quality update:', data.quality, '— speed:', data.networkSpeed);
+                ws.send(JSON.stringify({ type: 'quality_ack', quality: data.quality }));
+                return;
+            }
+
             ws.send(JSON.stringify({ status: 'received', type: data.type }));
         } catch (e) {
             ws.send(JSON.stringify({ status: 'error', error: e.message }));
@@ -437,6 +486,66 @@ wss.on('connection', (ws) => {
     ws.on('close', () => console.log('WS client disconnected'));
     ws.on('error', (err) => console.error('WS error:', err.message));
 });
+
+// ═══════════════════════════════════════════════════════════
+//  🆕 PARENT REMINDER CRON JOB
+// ═══════════════════════════════════════════════════════════
+const OFFLINE_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+async function checkOfflineDevices() {
+    try {
+        console.log('🔍 Checking offline devices...');
+
+        const devices = await Device.find({ isPaired: true });
+        const now = Date.now();
+
+        for (const device of devices) {
+            if (!device.lastSeen) continue;
+
+            const timeSince = now - new Date(device.lastSeen).getTime();
+
+            if (timeSince > OFFLINE_THRESHOLD_MS) {
+                console.log(`⚠️ Device offline: ${device.deviceName} (${Math.round(timeSince / 60000)} min)`);
+
+                // Find parent (user)
+                if (device.userId) {
+                    const user = await User.findById(device.userId);
+                    if (user && user.fcmToken) {
+                        try {
+                            await admin.messaging().send({
+                                token: user.fcmToken,
+                                notification: {
+                                    title: '⚠️ Child device offline',
+                                    body: `${device.deviceName || 'Device'} offline hai. Auto-start permission check karo.`
+                                },
+                                data: {
+                                    type: 'offline_alert',
+                                    deviceId: device.deviceId,
+                                    deviceName: device.deviceName || 'Device',
+                                    lastSeen: device.lastSeen.toString()
+                                },
+                                android: { priority: 'high' }
+                            });
+                            console.log(`✅ Parent notified for ${device.deviceId}`);
+                        } catch (e) {
+                            console.error('FCM notify failed:', e.message);
+                        }
+                    }
+                }
+            }
+        }
+
+        console.log('🔍 Offline check done');
+    } catch (err) {
+        console.error('checkOfflineDevices error:', err.message);
+    }
+}
+
+// Every 30 min
+setInterval(checkOfflineDevices, 30 * 60 * 1000);
+
+// Run once on startup (30 sec delay)
+setTimeout(checkOfflineDevices, 30 * 1000);
 
 // ═══════════════════════════════════════════════════════════
 //  START
