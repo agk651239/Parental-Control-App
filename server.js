@@ -14,6 +14,7 @@ const Device = require('./models/Device');
 const PairCode = require('./models/PairCode');
 const ActivityLog = require('./models/ActivityLog');
 const User = require('./models/User');
+const Schedule = require('./models/Schedule');   // ✅ NAYA
 
 // Middleware
 const { apiLimiter, uploadLimiter } = require('./middleware/rateLimit');
@@ -33,9 +34,7 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// ═══════════════════════════════════════════════════════════
-//  RENDER KE LIYE TRUST PROXY
-// ═══════════════════════════════════════════════════════════
+// ✅ Render ke liye trust proxy
 app.set('trust proxy', 1);
 
 app.use(cors());
@@ -106,6 +105,8 @@ app.use('/api/contact', require('./routes/contact'));
 app.use('/api/recording', require('./routes/recording'));
 app.use('/api/media', require('./routes/media'));
 app.use('/api/subscription', require('./routes/subscription'));
+app.use('/api/call', require('./routes/call'));           // ✅ Live calls
+app.use('/api/schedule', require('./routes/schedule'));   // ✅ NAYA — Schedule
 
 // ═══════════════════════════════════════════════════════════
 //  Health Check
