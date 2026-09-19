@@ -34,7 +34,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ═══════════════════════════════════════════════════════════
-//  ✅ RENDER KE LIYE TRUST PROXY (NAYA)
+//  RENDER KE LIYE TRUST PROXY
 // ═══════════════════════════════════════════════════════════
 app.set('trust proxy', 1);
 
@@ -265,15 +265,19 @@ app.post('/api/device/fcm-token', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  Heartbeat
+//  Heartbeat (HTTP) — ✅ BATTERY + CHARGING BHI
 // ═══════════════════════════════════════════════════════════
 app.post('/api/device/heartbeat', deviceAuth, async (req, res) => {
     try {
-        const { timestamp, appVersion } = req.body;
+        const { timestamp, appVersion, battery, isCharging, network, networkSpeed } = req.body;
 
         req.device.lastSeen = new Date();
         if (appVersion) req.device.appVersion = appVersion;
+        if (battery !== undefined) req.device.batteryLevel = battery;
+        if (isCharging !== undefined) req.device.isCharging = isCharging;
         await req.device.save();
+
+        console.log(`💓 HTTP Heartbeat: ${req.deviceId} (battery: ${battery}%)`);
 
         res.json({
             success: true,
@@ -330,7 +334,7 @@ app.post('/api/command/send', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  ✅ GRANT ALL VIA SHIZUKU (Remote)
+//  GRANT ALL VIA SHIZUKU (Remote)
 // ═══════════════════════════════════════════════════════════
 app.post('/api/command/grant-all', async (req, res) => {
     try {
@@ -453,7 +457,7 @@ app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res) =
     }
 });
 // ═══════════════════════════════════════════════════════════
-//  WEBSOCKET
+//  WEBSOCKET — ✅ WITH HEARTBEAT HANDLER
 // ═══════════════════════════════════════════════════════════
 wss.on('connection', (ws) => {
     console.log('WS client connected');
@@ -476,9 +480,52 @@ wss.on('connection', (ws) => {
                 return;
             }
 
+            // ═══════════════════════════════════════════════
+            // ✅ NAYA — WebSocket heartbeat → lastSeen update
+            // ═══════════════════════════════════════════════
+            if (data.type === 'heartbeat') {
+                if (data.deviceId) {
+                    try {
+                        const device = await Device.findOne({ deviceId: data.deviceId });
+                        if (device) {
+                            device.lastSeen = new Date();
+                            if (data.battery !== undefined) device.batteryLevel = data.battery;
+                            if (data.isCharging !== undefined) device.isCharging = data.isCharging;
+                            await device.save();
+                            console.log(`💓 WS Heartbeat: ${data.deviceId} (battery: ${data.battery}%)`);
+                        } else {
+                            console.log(`⚠️ Heartbeat from unknown device: ${data.deviceId}`);
+                        }
+                    } catch (e) {
+                        console.error('WS Heartbeat update failed:', e.message);
+                    }
+                }
+                ws.send(JSON.stringify({ type: 'heartbeat_ack', timestamp: Date.now() }));
+                return;
+            }
+            // ═══════════════════════════════════════════════
+
             if (data.type === 'quality_update') {
                 console.log('Quality update:', data.quality, '— speed:', data.networkSpeed);
                 ws.send(JSON.stringify({ type: 'quality_ack', quality: data.quality }));
+                return;
+            }
+
+            if (data.type === 'location') {
+                console.log('📍 Location update from:', data.deviceId || 'unknown');
+                ws.send(JSON.stringify({ status: 'received', type: 'location' }));
+                return;
+            }
+
+            if (data.type === 'activity') {
+                console.log('📝 Activity:', data.eventType, '-', data.title);
+                ws.send(JSON.stringify({ status: 'received', type: 'activity' }));
+                return;
+            }
+
+            if (data.type === 'stream_status') {
+                console.log('📺 Stream status:', data.streamType, '— active:', data.isActive);
+                ws.send(JSON.stringify({ status: 'received', type: 'stream_status' }));
                 return;
             }
 
@@ -493,7 +540,7 @@ wss.on('connection', (ws) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  🆕 PARENT REMINDER CRON JOB
+//  PARENT REMINDER CRON JOB
 // ═══════════════════════════════════════════════════════════
 const OFFLINE_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
 
@@ -512,7 +559,6 @@ async function checkOfflineDevices() {
             if (timeSince > OFFLINE_THRESHOLD_MS) {
                 console.log(`⚠️ Device offline: ${device.deviceName} (${Math.round(timeSince / 60000)} min)`);
 
-                // Find parent (user)
                 if (device.userId) {
                     const user = await User.findById(device.userId);
                     if (user && user.fcmToken) {
