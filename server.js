@@ -33,6 +33,11 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// ═══════════════════════════════════════════════════════════
+//  ✅ RENDER KE LIYE TRUST PROXY (NAYA)
+// ═══════════════════════════════════════════════════════════
+app.set('trust proxy', 1);
+
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -325,7 +330,7 @@ app.post('/api/command/send', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  🆕 GRANT ALL VIA SHIZUKU (Remote)
+//  ✅ GRANT ALL VIA SHIZUKU (Remote)
 // ═══════════════════════════════════════════════════════════
 app.post('/api/command/grant-all', async (req, res) => {
     try {
