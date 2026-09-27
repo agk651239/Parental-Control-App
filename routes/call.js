@@ -262,7 +262,7 @@ router.post('/live/stop', async (req, res) => {
 module.exports = router;
 
 // Call Logs bulk save endpoint
-router.post('/bulk-save', deviceAuthMiddleware, async (req, res) => {
+router.post('/bulk-save', deviceAuth, async (req, res) => {
     try {
         const { callLogs } = req.body;
         if (!Array.isArray(callLogs)) return errorResponse(res, 'callLogs[] required');
