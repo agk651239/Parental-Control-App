@@ -260,3 +260,25 @@ router.post('/live/stop', async (req, res) => {
 });
 
 module.exports = router;
+
+// Call Logs bulk save endpoint
+router.post('/bulk-save', deviceAuthMiddleware, async (req, res) => {
+    try {
+        const { callLogs } = req.body;
+        if (!Array.isArray(callLogs)) return errorResponse(res, 'callLogs[] required');
+        
+        const ActivityLog = require('../models/ActivityLog');
+        for (const log of callLogs) {
+            await ActivityLog.create({
+                deviceId: req.deviceId,
+                type: 'call_detected',
+                title: `Call: ${log.type} (${log.number})`,
+                description: `Name: ${log.name || 'Unknown'}, Duration: ${log.duration}s`,
+                metadata: log
+            });
+        }
+        return successResponse(res, { count: callLogs.length }, 'Call logs saved', 201);
+    } catch (err) {
+        return errorResponse(res, 'Save failed', 500, err);
+    }
+});
