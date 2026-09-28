@@ -297,6 +297,163 @@ app.post('/api/device/heartbeat', deviceAuth, async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+// ═══════════════════════════════════════════════════════════
+//  ✅✅✅ NAYA ADDED — DELETE Single Device (Parent App) ✅✅✅
+// ═══════════════════════════════════════════════════════════
+app.delete('/api/device/delete/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // MongoDB _id या deviceId — दोनों से try करो
+        let device = null;
+        if (id.match(/^[0-9a-fA-F]{24}$/)) {
+            device = await Device.findById(id);
+        }
+        if (!device) {
+            device = await Device.findOne({ deviceId: id });
+        }
+        if (!device) return res.status(404).json({ error: 'Device not found' });
+
+        // 🎥 WebSocket से भी हटाओ agar online है
+        const wsClient = activeSockets.get(device.deviceId);
+        if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+            try {
+                wsClient.send(JSON.stringify({
+                    type: 'command',
+                    command: 'UNPAIR',
+                    payload: {}
+                }));
+            } catch (_) {}
+            activeSockets.delete(device.deviceId);
+        }
+
+        // 📱 FCM से child को notify करो
+        if (device.fcmToken) {
+            try {
+                await admin.messaging().send({
+                    token: device.fcmToken,
+                    data: { command: 'UNPAIR', timestamp: String(Date.now()) },
+                    android: { priority: 'high' }
+                });
+            } catch (_) {}
+        }
+
+        // 🗑️ Pair codes भी delete करो
+        await PairCode.deleteMany({ deviceId: device.deviceId });
+
+        // 🗑️ Device record delete करो
+        await Device.findByIdAndDelete(device._id);
+
+        // 📝 Activity log
+        try {
+            await ActivityLog.create({
+                deviceId: device.deviceId,
+                type: 'device_deleted',
+                title: `Device deleted: ${device.deviceName}`,
+                description: 'Parent ne device ko unpair/delete kiya',
+                severity: 'info'
+            });
+        } catch (_) {}
+
+        res.json({
+            success: true,
+            message: 'Device deleted successfully',
+            deletedDeviceId: device.deviceId
+        });
+    } catch (err) {
+        console.error('Delete device error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  ✅✅✅ NAYA ADDED — DELETE Multiple Devices (Bulk) ✅✅✅
+// ═══════════════════════════════════════════════════════════
+app.post('/api/device/delete-bulk', async (req, res) => {
+    try {
+        const { deviceIds } = req.body;
+        if (!Array.isArray(deviceIds) || deviceIds.length === 0) {
+            return res.status(400).json({ error: 'deviceIds array required' });
+        }
+
+        let deletedCount = 0;
+        const deletedIds = [];
+
+        for (const id of deviceIds) {
+            let device = null;
+            if (id.match(/^[0-9a-fA-F]{24}$/)) {
+                device = await Device.findById(id);
+            }
+            if (!device) {
+                device = await Device.findOne({ deviceId: id });
+            }
+            if (!device) continue;
+
+            const wsClient = activeSockets.get(device.deviceId);
+            if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+                try {
+                    wsClient.send(JSON.stringify({
+                        type: 'command',
+                        command: 'UNPAIR',
+                        payload: {}
+                    }));
+                } catch (_) {}
+                activeSockets.delete(device.deviceId);
+            }
+
+            if (device.fcmToken) {
+                try {
+                    await admin.messaging().send({
+                        token: device.fcmToken,
+                        data: { command: 'UNPAIR' }
+                    });
+                } catch (_) {}
+            }
+
+            await PairCode.deleteMany({ deviceId: device.deviceId });
+            await Device.findByIdAndDelete(device._id);
+            deletedIds.push(device.deviceId);
+            deletedCount++;
+        }
+
+        res.json({
+            success: true,
+            message: `${deletedCount} devices deleted`,
+            deletedCount,
+            deletedIds
+        });
+    } catch (err) {
+        console.error('Bulk delete error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  ✅✅✅ NAYA ADDED — DELETE by deviceId (Alternative) ✅✅✅
+// ═══════════════════════════════════════════════════════════
+app.delete('/api/device/:deviceId', async (req, res) => {
+    try {
+        const { deviceId } = req.params;
+        const device = await Device.findOne({ deviceId });
+        if (!device) return res.status(404).json({ error: 'Device not found' });
+
+        if (device.fcmToken) {
+            try {
+                await admin.messaging().send({
+                    token: device.fcmToken,
+                    data: { command: 'UNPAIR' }
+                });
+            } catch (_) {}
+        }
+
+        await PairCode.deleteMany({ deviceId });
+        await Device.findByIdAndDelete(device._id);
+
+        res.json({ success: true, message: 'Device deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
 // ═══════════════════════════════════════════════════════════
 //  SEND COMMAND to Child Device (FCM)
@@ -359,8 +516,8 @@ app.post('/api/device/set-permission', async (req, res) => {
                 type: "command",
                 command: "SET_PERMISSION",
                 payload: {
-                    permission: permission, // e.g. "camera", "location", "accessibility", etc.
-                    enabled: String(enabled) // "true" or "false"
+                    permission: permission,
+                    enabled: String(enabled)
                 }
             };
             wsClient.send(JSON.stringify(commandMessage));
@@ -514,14 +671,12 @@ app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res) =
 });
 // ═══════════════════════════════════════════════════════════
 //  WEBSOCKET — ✅ ACTIVE SOCKETS + PROTECTION STATUS & HEARTBEAT
-//  🎥 VIDEO RELAY + PARENT TRACKING ADDED
 // ═══════════════════════════════════════════════════════════
 wss.on('connection', (ws, req) => {
     const parsedUrl = url.parse(req.url, true);
     const deviceId = parsedUrl.query.deviceId;
     const role = parsedUrl.query.role; // 'parent' if parent app connects
 
-    // ✅ Parent clients ko alag Set me track karo (video relay ke liye)
     if (role === 'parent') {
         parentClients.add(ws);
         console.log('📱 Parent dashboard connected via WebSocket');
