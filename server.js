@@ -1,7 +1,7 @@
 const http = require('http');
-const url = require('url'); // ✅ URL parser for WebSocket deviceId extraction
+const url = require('url'); // ✅ URL parser for WebSocket deviceId & role extraction
 const WebSocket = require('ws');
-const express = require('express'); // ✅ Express was missing in requires
+const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const cloudinary = require('cloudinary').v2;
@@ -35,8 +35,9 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// ✅ Active WebSockets Map (deviceId -> ws connection)
-const activeSockets = new Map();
+// ✅ Active WebSockets & Parent Dashboards tracking
+const activeSockets = new Map(); // deviceId -> ws connection
+const parentClients = new Set(); // Connected parent dashboard WebSockets
 
 // ✅ Render ke liye trust proxy
 app.set('trust proxy', 1);
@@ -120,7 +121,7 @@ app.get('/', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  Child App → Generate Pairing Code
+//  Device APIs (Pairing, Status, List, FCM, Heartbeat, Commands)
 // ═══════════════════════════════════════════════════════════
 app.post('/api/device/request-code', async (req, res) => {
     try {
@@ -148,9 +149,6 @@ app.post('/api/device/request-code', async (req, res) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  Parent App → Pair Device
-// ═══════════════════════════════════════════════════════════
 app.post('/api/device/pair', async (req, res) => {
     try {
         const { code, userId } = req.body;
@@ -185,9 +183,6 @@ app.post('/api/device/pair', async (req, res) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  GET Device Status
-// ═══════════════════════════════════════════════════════════
 app.get('/api/device/status', async (req, res) => {
     try {
         const { deviceId } = req.query;
@@ -209,9 +204,6 @@ app.get('/api/device/status', async (req, res) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  List Paired Devices
-// ═══════════════════════════════════════════════════════════
 app.get('/api/device/list', async (req, res) => {
     try {
         const devices = await Device.find({ isPaired: true })
@@ -223,9 +215,6 @@ app.get('/api/device/list', async (req, res) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  Refresh Pairing Code
-// ═══════════════════════════════════════════════════════════
 app.post('/api/device/refresh-code', async (req, res) => {
     try {
         const { deviceId } = req.body;
@@ -249,9 +238,6 @@ app.post('/api/device/refresh-code', async (req, res) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  Save FCM Token
-// ═══════════════════════════════════════════════════════════
 app.post('/api/device/fcm-token', async (req, res) => {
     try {
         const { deviceId, fcmToken } = req.body;
@@ -270,9 +256,6 @@ app.post('/api/device/fcm-token', async (req, res) => {
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  Heartbeat (HTTP) — ✅ BATTERY + CHARGING + PERMISSIONS
-// ═══════════════════════════════════════════════════════════
 app.post('/api/device/heartbeat', deviceAuth, async (req, res) => {
     try {
         const { timestamp, appVersion, battery, isCharging, network, networkSpeed, permissions } = req.body;
@@ -284,8 +267,6 @@ app.post('/api/device/heartbeat', deviceAuth, async (req, res) => {
         if (permissions) req.device.permissions = permissions;
         await req.device.save();
 
-        console.log(`💓 HTTP Heartbeat: ${req.deviceId} (battery: ${battery}%)`);
-
         res.json({
             success: true,
             message: 'Heartbeat received',
@@ -296,9 +277,7 @@ app.post('/api/device/heartbeat', deviceAuth, async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-// ═══════════════════════════════════════════════════════════
-//  SEND COMMAND to Child Device (FCM)
-// ═══════════════════════════════════════════════════════════
+
 app.post('/api/command/send', async (req, res) => {
     try {
         const { deviceId, command, payload } = req.body;
@@ -320,28 +299,12 @@ app.post('/api/command/send', async (req, res) => {
         };
 
         const response = await admin.messaging().send(message);
-
-        try {
-            await ActivityLog.create({
-                deviceId,
-                type: 'command_sent',
-                title: `Command sent: ${command}`,
-                description: JSON.stringify(payload || {}),
-                severity: 'info',
-                metadata: { command }
-            });
-        } catch (_) {}
-
         res.json({ success: true, message: 'Command sent', fcmResponseId: response });
     } catch (err) {
-        console.error('Command send error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  SET / TOGGLE PERMISSION (Remote ON/OFF from Parent Dashboard)
-// ═══════════════════════════════════════════════════════════
 app.post('/api/device/set-permission', async (req, res) => {
     try {
         const { deviceId, permission, enabled } = req.body;
@@ -350,158 +313,93 @@ app.post('/api/device/set-permission', async (req, res) => {
         const device = await Device.findOne({ deviceId });
         if (!device) return res.status(404).json({ error: 'Device not found' });
 
-        // 1. Try sending via active WebSocket connection
         const wsClient = activeSockets.get(deviceId);
         if (wsClient && wsClient.readyState === WebSocket.OPEN) {
-            const commandMessage = {
+            wsClient.send(JSON.stringify({
                 type: "command",
                 command: "SET_PERMISSION",
-                payload: {
-                    permission: permission, // e.g. "camera", "location", "accessibility", etc.
-                    enabled: String(enabled) // "true" or "false"
-                }
-            };
-            wsClient.send(JSON.stringify(commandMessage));
-            return res.json({ success: true, message: `Command sent via WS to set ${permission} to ${enabled}` });
+                payload: { permission, enabled: String(enabled) }
+            }));
+            return res.json({ success: true, message: `Command sent via WS` });
         }
 
-        // 2. Fallback to FCM if WebSocket is offline
         if (device.fcmToken) {
-            const fcmMessage = {
+            await admin.messaging().send({
                 token: device.fcmToken,
-                data: {
-                    command: 'SET_PERMISSION',
-                    permission: String(permission),
-                    enabled: String(enabled)
-                },
+                data: { command: 'SET_PERMISSION', permission: String(permission), enabled: String(enabled) },
                 android: { priority: 'high', ttl: 60 * 1000 }
-            };
-            await admin.messaging().send(fcmMessage);
-            return res.json({ success: true, message: 'Permission command sent via FCM (WS offline)' });
+            });
+            return res.json({ success: true, message: 'Permission command sent via FCM' });
         }
 
-        res.status(404).json({ success: false, message: "Device is offline (WS & FCM unavailable)" });
+        res.status(404).json({ success: false, message: "Device is offline" });
     } catch (err) {
-        console.error('Set permission error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  GRANT ALL VIA SHIZUKU (Remote)
-// ═══════════════════════════════════════════════════════════
 app.post('/api/command/grant-all', async (req, res) => {
     try {
         const { deviceId } = req.body;
-        if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-
         const device = await Device.findOne({ deviceId });
-        if (!device) return res.status(404).json({ error: 'Device not found' });
-        if (!device.fcmToken) return res.status(400).json({ error: 'Device has no FCM token' });
+        if (!device || !device.fcmToken) return res.status(404).json({ error: 'Device or FCM token not found' });
 
-        const message = {
+        const response = await admin.messaging().send({
             token: device.fcmToken,
-            data: {
-                command: 'GRANT_ALL_VIA_SHIZUKU',
-                timestamp: String(Date.now())
-            },
+            data: { command: 'GRANT_ALL_VIA_SHIZUKU', timestamp: String(Date.now()) },
             android: { priority: 'high', ttl: 60 * 1000 }
-        };
-
-        const response = await admin.messaging().send(message);
-
-        try {
-            await ActivityLog.create({
-                deviceId,
-                type: 'command_sent',
-                title: 'Grant all permissions requested',
-                description: 'Via Shizuku',
-                severity: 'info'
-            });
-        } catch (_) {}
-
-        res.json({
-            success: true,
-            message: 'Grant command sent',
-            fcmResponseId: response
         });
+
+        res.json({ success: true, message: 'Grant command sent', fcmResponseId: response });
     } catch (err) {
-        console.error('Grant all error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  Command Acknowledgment
-// ═══════════════════════════════════════════════════════════
 app.post('/api/command/ack', deviceAuth, async (req, res) => {
     try {
-        const { command, status, message, timestamp } = req.body;
-        if (!command) return res.status(400).json({ error: 'command required' });
-
+        const { command, status, message } = req.body;
         await ActivityLog.create({
             deviceId: req.deviceId,
             type: 'command_executed',
             title: `Command ${status}: ${command}`,
             description: message || '',
-            severity: status === 'success' ? 'info' : 'warning',
-            metadata: {
-                command,
-                status,
-                clientTimestamp: timestamp
-            }
+            severity: status === 'success' ? 'info' : 'warning'
         });
-
         res.json({ success: true, message: 'ACK received' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  Activity Log
-// ═══════════════════════════════════════════════════════════
 app.post('/api/activity/save', deviceAuth, async (req, res) => {
     try {
         const { type, title, description, severity, metadata, timestamp } = req.body;
-        if (!type || !title) return res.status(400).json({ error: 'type and title required' });
-
-        const log = await ActivityLog.create({
-            deviceId: req.deviceId,
-            type,
-            title,
-            description: description || '',
-            severity: severity || 'info',
-            metadata: metadata || {},
+        await ActivityLog.create({
+            deviceId: req.deviceId, type, title, description: description || '',
+            severity: severity || 'info', metadata: metadata || {},
             timestamp: timestamp ? new Date(timestamp) : new Date()
         });
-
-        res.json({ success: true, message: 'Activity logged', id: log._id });
+        res.json({ success: true, message: 'Activity logged' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// ═══════════════════════════════════════════════════════════
-//  Media Upload
-// ═══════════════════════════════════════════════════════════
 app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'No file' });
-
         const { deviceId, mediaType } = req.body;
         const uploadStream = cloudinary.uploader.upload_stream(
             { folder: 'parental_control_media', resource_type: 'auto' },
             async (error, result) => {
                 if (error) return res.status(500).json({ error: error.message });
-
                 await Media.create({
                     deviceId: deviceId || 'unknown',
                     fileUrl: result.secure_url,
                     publicId: result.public_id,
                     mediaType: mediaType || 'image'
                 });
-
                 res.json({ success: true, url: result.secure_url });
             }
         );
@@ -510,24 +408,36 @@ app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res) =
         res.status(500).json({ error: err.message });
     }
 });
-
 // ═══════════════════════════════════════════════════════════
-//  WEBSOCKET — ✅ ACTIVE SOCKETS + PROTECTION STATUS & HEARTBEAT
+//  WEBSOCKET — ✅ STREAMING RELAY + HEARTBEAT + PROTECTION STATUS
 // ═══════════════════════════════════════════════════════════
 wss.on('connection', (ws, req) => {
     const parsedUrl = url.parse(req.url, true);
     const deviceId = parsedUrl.query.deviceId;
+    const role = parsedUrl.query.role; // 'parent' if parent dashboard connects
 
-    if (deviceId) {
+    if (role === 'parent') {
+        parentClients.add(ws);
+        console.log('📱 Parent dashboard connected via WebSocket');
+    } else if (deviceId) {
         activeSockets.set(deviceId, ws);
         console.log(`🔌 WS client connected for device: ${deviceId}`);
-    } else {
-        console.log('🔌 WS client connected (no deviceId)');
     }
 
     ws.on('message', async (msg) => {
         try {
             const data = JSON.parse(msg.toString());
+
+            // 🎥 LIVE VIDEO STREAMING RELAY (`camera_frame` & `screen_frame`)
+            if (data.type === 'camera_frame' || data.type === 'screen_frame') {
+                // Child device se aaye huye frame ko sabhi connected parents ko broadcast/relay karein
+                parentClients.forEach(parentWs => {
+                    if (parentWs.readyState === WebSocket.OPEN) {
+                        parentWs.send(JSON.stringify(data));
+                    }
+                });
+                return;
+            }
 
             if (data.type === 'ping') {
                 ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -543,18 +453,13 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // ✅ NAYA — Protection & Permissions Status Update
+            // ✅ Protection & Permissions Status Update
             if (data.type === 'protection_status') {
                 if (data.deviceId && data.permissions) {
                     try {
                         await Device.findOneAndUpdate(
                             { deviceId: data.deviceId },
-                            { 
-                                $set: { 
-                                    permissions: data.permissions,
-                                    lastSeen: new Date()
-                                } 
-                            },
+                            { $set: { permissions: data.permissions, lastSeen: new Date() } },
                             { upsert: true }
                         );
                         console.log(`🛡️ Protection status updated for device: ${data.deviceId}`);
@@ -566,7 +471,7 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // ✅ WebSocket heartbeat → lastSeen, battery & permissions update
+            // ✅ WebSocket Heartbeat
             if (data.type === 'heartbeat') {
                 if (data.deviceId) {
                     try {
@@ -577,37 +482,12 @@ wss.on('connection', (ws, req) => {
                             if (data.isCharging !== undefined) device.isCharging = data.isCharging;
                             if (data.permissions) device.permissions = data.permissions;
                             await device.save();
-                            console.log(`💓 WS Heartbeat: ${data.deviceId} (battery: ${data.battery}%)`);
                         }
                     } catch (e) {
                         console.error('WS Heartbeat update failed:', e.message);
                     }
                 }
                 ws.send(JSON.stringify({ type: 'heartbeat_ack', timestamp: Date.now() }));
-                return;
-            }
-
-            if (data.type === 'quality_update') {
-                console.log('Quality update:', data.quality, '— speed:', data.networkSpeed);
-                ws.send(JSON.stringify({ type: 'quality_ack', quality: data.quality }));
-                return;
-            }
-
-            if (data.type === 'location') {
-                console.log('📍 Location update from:', data.deviceId || 'unknown');
-                ws.send(JSON.stringify({ status: 'received', type: 'location' }));
-                return;
-            }
-
-            if (data.type === 'activity') {
-                console.log('📝 Activity:', data.eventType, '-', data.title);
-                ws.send(JSON.stringify({ status: 'received', type: 'activity' }));
-                return;
-            }
-
-            if (data.type === 'stream_status') {
-                console.log('📺 Stream status:', data.streamType, '— active:', data.isActive);
-                ws.send(JSON.stringify({ status: 'received', type: 'stream_status' }));
                 return;
             }
 
@@ -618,10 +498,13 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('close', () => {
+        parentClients.delete(ws);
         if (deviceId) activeSockets.delete(deviceId);
-        console.log(`WS client disconnected: ${deviceId || 'unknown'}`);
+        console.log(`WS client disconnected: ${deviceId || 'parent'}`);
     });
+
     ws.on('error', (err) => {
+        parentClients.delete(ws);
         if (deviceId) activeSockets.delete(deviceId);
         console.error('WS error:', err.message);
     });
@@ -634,60 +517,38 @@ const OFFLINE_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 async function checkOfflineDevices() {
     try {
-        console.log('🔍 Checking offline devices...');
-
         const devices = await Device.find({ isPaired: true });
         const now = Date.now();
 
         for (const device of devices) {
             if (!device.lastSeen) continue;
-
             const timeSince = now - new Date(device.lastSeen).getTime();
 
-            if (timeSince > OFFLINE_THRESHOLD_MS) {
-                console.log(`⚠️ Device offline: ${device.deviceName} (${Math.round(timeSince / 60000)} min)`);
-
-                if (device.userId) {
-                    const user = await User.findById(device.userId);
-                    if (user && user.fcmToken) {
-                        try {
-                            await admin.messaging().send({
-                                token: user.fcmToken,
-                                notification: {
-                                    title: '⚠️ Child device offline',
-                                    body: `${device.deviceName || 'Device'} offline hai. Auto-start permission check karo.`
-                                },
-                                data: {
-                                    type: 'offline_alert',
-                                    deviceId: device.deviceId,
-                                    deviceName: device.deviceName || 'Device',
-                                    lastSeen: device.lastSeen.toString()
-                                },
-                                android: { priority: 'high' }
-                            });
-                            console.log(`✅ Parent notified for ${device.deviceId}`);
-                        } catch (e) {
-                            console.error('FCM notify failed:', e.message);
-                        }
-                    }
+            if (timeSince > OFFLINE_THRESHOLD_MS && device.userId) {
+                const user = await User.findById(device.userId);
+                if (user && user.fcmToken) {
+                    try {
+                        await admin.messaging().send({
+                            token: user.fcmToken,
+                            notification: {
+                                title: '⚠️ Child device offline',
+                                body: `${device.deviceName || 'Device'} offline hai.`
+                            },
+                            data: { type: 'offline_alert', deviceId: device.deviceId },
+                            android: { priority: 'high' }
+                        });
+                    } catch (e) {}
                 }
             }
         }
-
-        console.log('🔍 Offline check done');
-    } catch (err) {
-        console.error('checkOfflineDevices error:', err.message);
-    }
+    } catch (err) {}
 }
 
-// Every 30 min
 setInterval(checkOfflineDevices, 30 * 60 * 1000);
-
-// Run once on startup (30 sec delay)
 setTimeout(checkOfflineDevices, 30 * 1000);
 
 // ═══════════════════════════════════════════════════════════
-//  START
+//  START SERVER
 // ═══════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
