@@ -35,7 +35,7 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// ✅ Active WebSockets Map & Parent Clients Tracking
+// ✅ Active WebSockets Map & Parent Clients Tracking (Added for video relay)
 const activeSockets = new Map();
 const parentClients = new Set(); // 🎥 Parent dashboards for video relay
 
