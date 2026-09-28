@@ -514,12 +514,14 @@ app.post('/api/upload', uploadLimiter, upload.single('file'), async (req, res) =
 });
 // ═══════════════════════════════════════════════════════════
 //  WEBSOCKET — ✅ ACTIVE SOCKETS + PROTECTION STATUS & HEARTBEAT
+//  🎥 VIDEO RELAY + PARENT TRACKING ADDED
 // ═══════════════════════════════════════════════════════════
 wss.on('connection', (ws, req) => {
     const parsedUrl = url.parse(req.url, true);
     const deviceId = parsedUrl.query.deviceId;
     const role = parsedUrl.query.role; // 'parent' if parent app connects
 
+    // ✅ Parent clients ko alag Set me track karo (video relay ke liye)
     if (role === 'parent') {
         parentClients.add(ws);
         console.log('📱 Parent dashboard connected via WebSocket');
@@ -643,7 +645,6 @@ wss.on('connection', (ws, req) => {
         console.error('WS error:', err.message);
     });
 });
-
 // ═══════════════════════════════════════════════════════════
 //  PARENT REMINDER CRON JOB
 // ═══════════════════════════════════════════════════════════
