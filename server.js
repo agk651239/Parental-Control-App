@@ -298,23 +298,34 @@ app.post('/api/device/heartbeat', deviceAuth, async (req, res) => {
     }
 });
 // ═══════════════════════════════════════════════════════════
-//  ✅✅✅ NAYA ADDED — DELETE Single Device (Parent App) ✅✅✅
+//  ✅✅✅ NAYA ADDED — DELETE Device by deviceId ✅✅✅
+//  Parent App (Retrofit) call: DELETE /api/device/remove/{deviceId}
+//  ⚠️ ये route `app.delete('/api/device/:deviceId', ...)` के ऊपर होना चाहिए
 // ═══════════════════════════════════════════════════════════
-app.delete('/api/device/delete/:id', async (req, res) => {
+app.delete('/api/device/remove/:deviceId', async (req, res) => {
     try {
-        const { id } = req.params;
+        const { deviceId } = req.params;
+        console.log(`🗑️ DELETE /api/device/remove/${deviceId} called`);
 
-        // MongoDB _id या deviceId — दोनों से try करो
+        if (!deviceId) {
+            return res.status(400).json({ error: 'deviceId required' });
+        }
+
+        // deviceId ya MongoDB _id — दोनों से try करो
         let device = null;
-        if (id.match(/^[0-9a-fA-F]{24}$/)) {
-            device = await Device.findById(id);
+        if (deviceId.match(/^[0-9a-fA-F]{24}$/)) {
+            device = await Device.findById(deviceId);
         }
         if (!device) {
-            device = await Device.findOne({ deviceId: id });
+            device = await Device.findOne({ deviceId });
         }
-        if (!device) return res.status(404).json({ error: 'Device not found' });
 
-        // 🎥 WebSocket से भी हटाओ agar online है
+        if (!device) {
+            console.log(`❌ Device not found: ${deviceId}`);
+            return res.status(404).json({ error: 'Device not found' });
+        }
+
+        // 🎥 WebSocket से हटाओ (agar online hai)
         const wsClient = activeSockets.get(device.deviceId);
         if (wsClient && wsClient.readyState === WebSocket.OPEN) {
             try {
@@ -345,6 +356,71 @@ app.delete('/api/device/delete/:id', async (req, res) => {
         await Device.findByIdAndDelete(device._id);
 
         // 📝 Activity log
+        try {
+            await ActivityLog.create({
+                deviceId: device.deviceId,
+                type: 'device_deleted',
+                title: `Device deleted: ${device.deviceName}`,
+                description: 'Parent ne device delete kiya',
+                severity: 'info'
+            });
+        } catch (_) {}
+
+        console.log(`✅ Device deleted: ${device.deviceId}`);
+
+        // ✅ Parent app BasicResponse expect कर रहा है
+        res.json({
+            success: true,
+            message: 'Device deleted successfully',
+            deletedDeviceId: device.deviceId
+        });
+    } catch (err) {
+        console.error('Delete device error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  ✅✅✅ NAYA ADDED — DELETE Single Device (Alternative URLs) ✅✅✅
+// ═══════════════════════════════════════════════════════════
+app.delete('/api/device/delete/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        let device = null;
+        if (id.match(/^[0-9a-fA-F]{24}$/)) {
+            device = await Device.findById(id);
+        }
+        if (!device) {
+            device = await Device.findOne({ deviceId: id });
+        }
+        if (!device) return res.status(404).json({ error: 'Device not found' });
+
+        const wsClient = activeSockets.get(device.deviceId);
+        if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+            try {
+                wsClient.send(JSON.stringify({
+                    type: 'command',
+                    command: 'UNPAIR',
+                    payload: {}
+                }));
+            } catch (_) {}
+            activeSockets.delete(device.deviceId);
+        }
+
+        if (device.fcmToken) {
+            try {
+                await admin.messaging().send({
+                    token: device.fcmToken,
+                    data: { command: 'UNPAIR', timestamp: String(Date.now()) },
+                    android: { priority: 'high' }
+                });
+            } catch (_) {}
+        }
+
+        await PairCode.deleteMany({ deviceId: device.deviceId });
+        await Device.findByIdAndDelete(device._id);
+
         try {
             await ActivityLog.create({
                 deviceId: device.deviceId,
@@ -429,7 +505,8 @@ app.post('/api/device/delete-bulk', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  ✅✅✅ NAYA ADDED — DELETE by deviceId (Alternative) ✅✅✅
+//  ✅✅✅ NAYA ADDED — DELETE by deviceId (Catch-all) ✅✅✅
+//  ⚠️ ये route सबसे आखिर में होना चाहिए ताकि ऊपर वाले routes override ना हों
 // ═══════════════════════════════════════════════════════════
 app.delete('/api/device/:deviceId', async (req, res) => {
     try {
