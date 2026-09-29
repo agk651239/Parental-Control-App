@@ -121,19 +121,32 @@ app.get('/', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  Child App → Generate Pairing Code
+//  Child App → Generate Pairing Code (✅ FIXED VERSION)
 // ═══════════════════════════════════════════════════════════
 app.post('/api/device/request-code', async (req, res) => {
     try {
         const { deviceId, deviceName } = req.body;
         if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
 
+        // ✅ UPSERT — device न हो तो बना दो
         let device = await Device.findOne({ deviceId });
         if (!device) {
-            device = new Device({ deviceId, deviceName: deviceName || 'Unknown Device' });
+            device = new Device({
+                deviceId,
+                deviceName: deviceName || 'Unknown Device'
+            });
             await device.save();
+        } else {
+            // अगर device existing है और deviceName missing है → update करो
+            if (deviceName && (device.deviceName === 'Unknown Device' || !device.deviceName)) {
+                device.deviceName = deviceName;
+                await device.save();
+            }
         }
-        if (device.isPaired) return res.status(400).json({ error: 'Already paired', isPaired: true });
+
+        if (device.isPaired) {
+            return res.status(400).json({ error: 'Already paired', isPaired: true });
+        }
 
         await PairCode.deleteMany({ deviceId, isUsed: false });
         const code = await generateUniqueCode();
@@ -143,7 +156,13 @@ app.post('/api/device/request-code', async (req, res) => {
             expiresAt: new Date(Date.now() + 10 * 60 * 1000)
         });
 
-        res.json({ success: true, code, deviceId, deviceName: device.deviceName, expiresIn: 600 });
+        res.json({
+            success: true,
+            code,
+            deviceId,
+            deviceName: device.deviceName,
+            expiresIn: 600
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -251,22 +270,40 @@ app.post('/api/device/refresh-code', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  Save FCM Token
+//  Save FCM Token (✅ FIXED — UPSERT)
 // ═══════════════════════════════════════════════════════════
 app.post('/api/device/fcm-token', async (req, res) => {
     try {
-        const { deviceId, fcmToken } = req.body;
-        if (!deviceId || !fcmToken) return res.status(400).json({ error: 'deviceId and fcmToken required' });
+        const { deviceId, fcmToken, deviceName } = req.body;
+        if (!deviceId || !fcmToken) {
+            return res.status(400).json({ error: 'deviceId and fcmToken required' });
+        }
 
-        const device = await Device.findOne({ deviceId });
-        if (!device) return res.status(404).json({ error: 'Device not found' });
+        // ✅ UPSERT — device न हो तो बना दो
+        const device = await Device.findOneAndUpdate(
+            { deviceId },
+            {
+                $set: {
+                    fcmToken: fcmToken,
+                    lastSeen: new Date()
+                },
+                $setOnInsert: {
+                    deviceName: deviceName || 'Unknown Device',
+                    isPaired: false
+                }
+            },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
 
-        device.fcmToken = fcmToken;
-        device.lastSeen = new Date();
-        await device.save();
-
-        res.json({ success: true, message: 'FCM token saved' });
+        console.log(`✅ FCM token saved for device: ${deviceId}`);
+        res.json({
+            success: true,
+            message: 'FCM token saved',
+            deviceId: device.deviceId,
+            isPaired: device.isPaired
+        });
     } catch (err) {
+        console.error('FCM token save error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -368,7 +405,6 @@ app.delete('/api/device/remove/:deviceId', async (req, res) => {
 
         console.log(`✅ Device deleted: ${device.deviceId}`);
 
-        // ✅ Parent app BasicResponse expect कर रहा है
         res.json({
             success: true,
             message: 'Device deleted successfully',
@@ -877,6 +913,7 @@ wss.on('connection', (ws, req) => {
         console.error('WS error:', err.message);
     });
 });
+
 // ═══════════════════════════════════════════════════════════
 //  PARENT REMINDER CRON JOB
 // ═══════════════════════════════════════════════════════════
